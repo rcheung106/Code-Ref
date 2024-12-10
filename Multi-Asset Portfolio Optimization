@@ -1,0 +1,881 @@
+##1. Stock selection and individual stock prices and returns (2017M1 - 2024M10)
+#Enter ticker symbols for analysis
+user_input <- readline('Please enter symbols (tickers), separated by commas e.g.AMD,GOOGL,MSFT,TSLA,NVDA:\n')
+
+# Use default if no input is provided
+default_value <- 'V, DIS, ECL, PG, HD'
+
+# Process the stock list into correct format
+stocklist <- ifelse(user_input == "", default_value, user_input)
+stocklist <- trimws(stocklist)  # Trim whitespace
+stocklist <- gsub("\\s+", "", stocklist)  # Remove any spaces
+stocklist <- unlist(strsplit(stocklist, ","))  # Split into a vector
+cat("Your chosen assets are:", paste0("c(", paste0('"', stocklist, '"', collapse = ","), ")"), "\n")
+
+#Define start and end dates
+start_date <- as.Date('01-01-2017',format = "%m-%d-%Y")
+end_date <- as.Date('10-30-2024',format = "%m-%d-%Y")
+
+#Download prices for each stock
+stock_data <- NULL
+for (sym in stocklist) {
+  stock_data <- cbind(stock_data,getSymbols(sym, src = "yahoo", from = start_date, to = end_date, periodicity='monthly', auto.assign = FALSE)[,6])
+}
+
+colnames(stock_data) <- stocklist
+stock_data_tbl <- stock_data %>% tk_tbl()
+stock_data_long <- pivot_longer(stock_data_tbl,
+             cols = -index,
+             names_to = 'symbol',
+             values_to = 'price'
+             )
+
+ggplot(stock_data_long,aes(x = index,y = price)) +
+  geom_line(color='#00008a')+
+  theme_minimal()+
+  labs(title='In-sample Stock Price (2017M1 to 2024M10)',x='Date',y='Stock Price')+
+  facet_wrap(~ symbol,scales = "free_y")+
+  theme(legend.position="none")
+
+# Calculate log returns for all numeric columns
+stock_returns <- diff(log(stock_data)) %>% na.omit()
+
+stock_returns_tbl <- stock_returns %>% tk_tbl()
+
+stock_returns_long <- pivot_longer(stock_returns_tbl,
+             cols = -index,
+             names_to = 'symbol',
+             values_to = 'return'
+             )
+
+#Stock returns bar graph
+ggplot(stock_returns_long,aes(x = index,y = return, color = symbol)) +
+  geom_bar(stat = 'identity',color='#00008a') +
+  theme_minimal()+
+  labs(title='Monthly Stock Return (2017M1 to 2024M10)',x='Date',y='Price')+
+  facet_wrap(~ symbol,scales = "free_y")+
+  theme(legend.position="none")+
+  
+  scale_y_continuous(labels = scales::percent)
+
+#Stock returns box plot
+stock_returns_long %>% 
+  ggplot(aes(symbol, return)) + 
+  geom_boxplot(color='#00008a') + 
+  theme_minimal() +
+  labs(x="symbols", y="returns")+
+  scale_y_continuous(labels = scales::percent)+
+  labs(title='Stock Return Box Plot (2017M1 to 2024M10)',x='Stock',y='Return')
+
+#Stock returns distribution
+stock_returns_long %>% 
+  ggplot(aes(return)) +
+  geom_density(lwd=1,color='#EEDC82') +
+  theme_minimal() +
+  geom_histogram(aes(y=..density..), fill = '#00008a',color='black',binwidth = 0.009)+
+  facet_wrap(~symbol,scales = "free_x") + xlab('return')+
+  scale_x_continuous(labels = scales::percent)+
+  labs(x="Return", y="Frequency",title='Stock Return Distribution (2017M1 to 2024M10)')
+
+-----------------------------------------------------------------------------------------------------
+
+##2. Modern Portfolio Theory-Based Optimization (2017M1 - 2020M12)
+#Extract 10-Year Treasury Yield as Benchmark, apply date transformation, fill up the NA values with last available value, then perform lag adjustment
+start_date_mpt <- as.Date('01-01-2017',format = "%m-%d-%Y")
+end_date_mpt <- as.Date('12-31-2020',format = "%m-%d-%Y")
+bmrk <- getSymbols("^TNX", src = "yahoo", from = start_date, to = end_date,auto.assign = FALSE)
+bmrk <- apply.monthly(bmrk[,-1], function(x) head(x, 1))
+bmrk <- bmrk[, "TNX.Adjusted"] / 1200
+bmrk <- na.locf(bmrk,fromLast = TRUE)
+index(bmrk) <- as.Date(format(index(bmrk), "%Y-%m-01"))
+bmrk <- bmrk[-1,]
+bmrk_trim <- bmrk[paste(start_date_mpt, end_date_mpt, sep = "/")]
+
+#Excess return for portfolio optimization
+stock_returns_trim <- stock_returns[paste(start_date_mpt, end_date_mpt, sep = "/")]
+excessret <- lapply(stock_returns, function(ret) ret - bmrk)
+excessret <- do.call(merge, excessret)
+
+#Combine everything into dataframes
+stock_data_trim <- stock_data[paste(start_date_mpt, end_date_mpt, sep = "/")]
+price_df <- data.frame(Date = index(stock_data_trim), coredata(stock_data_trim))
+return_df <- data.frame(Date = index(stock_returns_trim),coredata(stock_returns_trim))
+colnames(return_df)[-1] <- paste0(stocklist, "_LogReturn")
+bmrk_df <- data.frame(Date = index(bmrk_trim), coredata(bmrk_trim))
+er_df <- data.frame(Date=index(excessret),coredata(excessret))
+colnames(er_df)[-1] <- paste0(stocklist, "_ExcessReturn")
+
+#Create VCV and Return Matrices
+vcv_matrix <- cov(return_df[, sapply(return_df, is.numeric)])
+colnames(vcv_matrix) <- stocklist
+rownames(vcv_matrix) <- stocklist
+
+#Find averages
+avg_ret_matrix = matrix(colMeans(stock_returns_trim))
+avg_er_matrix = matrix(colMeans(excessret))
+bmrk_mean = mean(bmrk_trim[,1])
+
+#Display Average Returns and Excess Returns in a single matrix
+ret_er_matrix <- matrix(c(avg_ret_matrix, avg_er_matrix), ncol=2)
+dimnames(ret_er_matrix) = list(stocklist, c("Return ", "Excess Return"))
+
+#Find optimal weights - short sale allowed
+z_s_allowed <- solve(vcv_matrix) %*% avg_er_matrix
+w_s_allowed <- z_s_allowed/sum(z_s_allowed)
+dimnames(w_s_allowed) <- list(stocklist, "Weights - Short Sale Allowed")  
+
+#Find optimal weights - short sale not allowed
+vcv_matrix_ns <- vcv_matrix
+avg_er_matrix_ns <- avg_er_matrix
+
+id_matrix <- cbind(1, diag(ncol(vcv_matrix_ns)))  # Sum-to-one and no-short constraints
+rhs_vec <- c(1, rep(0, ncol(vcv_matrix_ns)))  # RHS for constraints
+
+result <- solve.QP(vcv_matrix_ns, avg_er_matrix_ns, id_matrix, rhs_vec, meq = 1) #Solve for the optimal weights
+w_ns <- matrix(result$solution, ncol=1)
+dimnames(w_ns) <- list(stocklist, "Weights - Short Sale Not Allowed")
+w_ns[abs(w_ns) < 1e-6] <- 0 # Round extremely small values to zero
+
+#Find Global Minimum Variance Portfolio
+num_stock <- length(stocklist)
+ones_vec <- matrix(rep(1, num_stock), nrow = num_stock)        
+z_gmv <- solve(vcv_matrix) %*% ones_vec                               
+w_gmv <- z_gmv / sum(z_gmv) 
+dimnames(w_gmv) <- list(stocklist, "Weights - Global Minimum Variance")
+# Variance-Covariance Matrix
+vcv_matrix
+# Mean and Excess Returns Matrix
+ret_er_matrix
+cat("Average Monthly Risk Free Rate:", paste0(round(bmrk_mean,5)))
+w_s_allowed
+w_ns
+w_gmv
+
+#Write weight matrices into data frames for plotting
+w_s_allowed_df <- as.data.frame(w_s_allowed)
+w_s_allowed_df <- data.frame(
+  symbol = stocklist,
+  Weights = as.numeric(w_s_allowed)
+)
+
+w_ns_df <- as.data.frame(w_ns)
+w_ns_df <- data.frame(
+  symbol = stocklist,
+  Weights = as.numeric(w_ns)
+)
+
+w_gmv_df <- as.data.frame(w_ns_df)
+w_gmv_df <- data.frame(
+  symbol = stocklist,
+  Weights = as.numeric(w_gmv)
+)
+
+w_s_allowed_graph <- w_s_allowed_df %>%
+  ggplot(aes(x = symbol, y = Weights))+
+  geom_bar(stat = 'identity', color = 'black', fill = '#FA8072')+
+  theme_minimal() +                                              
+  labs(x = 'Symbol', y = 'Weights', title = "Optimized Porfolio - Short Sales Allowed")+
+  geom_text(aes(label = scales::percent(Weights, accuracy = 0.1),y = Weights), 
+            vjust = -0.5, size = 3)+
+  scale_y_continuous(labels = scales::percent,expand = expansion(mult = c(0.3, 0.3)))    
+
+w_ns_graph <- w_ns_df %>%
+  ggplot(aes(x = symbol, y = Weights))+
+  geom_bar(stat = 'identity', color = 'black', fill = '#663399')+
+  theme_minimal() +                                              
+  labs(x = 'Symbol', y = 'Weights', title = "Optimized Porfolio - No Short Sales")+
+  geom_text(aes(label = scales::percent(Weights, accuracy = 0.1),y = Weights), 
+            vjust = -0.5, size = 3)+
+  scale_y_continuous(labels = scales::percent,expand = expansion(mult = c(0, 0.3)))    
+   
+
+w_gmv_graph <- w_gmv_df %>%
+  ggplot(aes(x = symbol, y = Weights))+
+  geom_bar(stat = 'identity',color='black',fill='blue')+
+  theme_minimal()+
+  labs(x = 'Symbol', y = 'Weights', title = "Minimum Variance Portfolio Weights")+
+  geom_text(aes(label = scales::percent(Weights, accuracy = 0.1),y = Weights), 
+            vjust = -0.5, size = 3)+
+  scale_y_continuous(labels = scales::percent,expand = expansion(mult = c(0, 0.3)))    
+
+library(gridExtra)
+grid.arrange(w_s_allowed_graph,w_ns_graph,w_gmv_graph)
+
+#Plotting Capital Allocation Line, Efficient Frontier, and Tangency Portfolio
+set.seed(0)
+names <- c(stocklist,'Total')
+rand <- runif(50000, min = -0.3, max = 1)
+
+comb_weights <- matrix(rand,nrow=20000,ncol=length(stocklist))
+comb_weights <- cbind(comb_weights, rep(NA,20000))
+colnames(comb_weights) <- names
+
+#Loop through each combination of random number and convert to weight as % of total
+for (i in 1:20000) {
+  comb_weights[i,length(stocklist)+1] <- sum(comb_weights[i,1:length(stocklist)])
+  comb_weights[i,1:length(stocklist)] <- comb_weights[i,1:length(stocklist)]/comb_weights[i,length(stocklist)+1]
+}
+
+#Remove the placeholder total column and write results into dataframe for plotting
+comb_weights <- comb_weights[,-ncol(comb_weights)]
+comb_weights_df <- data.frame(comb_weights) %>% round(3)
+
+# Calculate mean return
+mean_returns <- colMeans(stock_returns)
+portfolio_risk <- rep(NA,20000)
+portfolio_returns <- rep(NA,20000)
+sharpe <- rep(NA,20000)
+
+for (i in 1:20000) {
+  weights <- comb_weights[i,]
+  portfolio_risk[i] <- sqrt(sum((weights %*% vcv_matrix)*weights))*sqrt(12)
+  portfolio_returns[i] <- sum(weights * mean_returns)*12
+  sharpe[i] <- (portfolio_returns[i] - bmrk_df[nrow(bmrk_df),2])/portfolio_risk[i]
+}
+
+comb_df <- data.frame(comb_weights_df, Risk = portfolio_risk,Return=portfolio_returns,Sharpe = sharpe)
+
+min_var <- comb_df[comb_df$Risk==min(comb_df$Risk),]
+max_sr <- comb_df[comb_df$Sharpe==max(comb_df$Sharpe),]
+asset_df <- data.frame()
+
+for (i in 1:length(stocklist)) {
+  symbol <- stocklist[i]
+  return_value <- mean_returns[i] * 12
+  risk_value <- sqrt(vcv_matrix[i, i]) * sqrt(12)
+  
+# Create a data frame for the current asset
+asset <- data.frame(Symbol = symbol, Return = return_value, Risk = risk_value)
+asset_df <- rbind(asset_df, asset)}
+
+r_s_allowed <- t(w_s_allowed) %*% avg_ret_matrix
+v_s_allowed <- t(w_s_allowed) %*% vcv_matrix %*% w_s_allowed
+sd_s_allowed <- v_s_allowed^0.5
+
+rf = bmrk_df[nrow(bmrk_df),2]
+tan_risk <- sd_s_allowed*sqrt(12)
+tan_return <- r_s_allowed*12
+tan_sharpe <- (tan_return-rf)/tan_risk
+# Create dynamic layer for individual stocks on the chart
+library(dplyr)
+library(purrr)
+stock_layers <- map(1:length(stocklist), function(i) {
+  list(
+    geom_point(aes(x = asset_df$Risk[i], y = asset_df$Return[i]), color = '#0000FF', size = 3),
+    annotate('text', x = asset_df$Risk[i]+0.005, y = asset_df$Return[i], 
+             label = stocklist[i], fontface = "bold", hjust=0)
+  )
+})
+
+
+comb_df %>%
+  ggplot(aes(x=Risk, y=Return, color = Sharpe))+ 
+  geom_point(alpha=0.2)+ 
+  theme_minimal()+
+  scale_x_continuous(labels = scales::percent)+
+  scale_y_continuous(labels = scales::percent)+
+  labs(title = paste('Efficient Frontier graph of', length(stocklist), '-security portfolio - Short Sales Allowed'),x='Potfolio Risk',y='Portfolio Return')+
+  geom_abline(aes(intercept=rf,slope = max_sr$Sharpe),linewidth=1.5,color='grey')+
+  geom_point(aes(x=max_sr$Risk,y=max_sr$Return), data = max_sr, color = 'yellow',size=3)+
+  geom_point(aes(x=min_var$Risk,y=min_var$Return),data = min_var, color = 'red', size=3)+
+  annotate('text', x=max_sr$Risk+0.03,y=max_sr$Return-0.03, label = "Tangency Portfolio - MC",fontface = "bold")+
+  annotate('text', x=min_var$Risk+0.08,y=min_var$Return, label = "Minimum Variance",fontface = "bold")+
+  stock_layers+
+  coord_cartesian(xlim = c(0.1, 0.6), ylim = c(-0.1, 0.4))
+
+-----------------------------------------------------------------------------------------------------
+
+3. Allocation of $100 to selected stocks assuming fixed holdings and no rebalancing (2021M1- 2024M6)
+
+#Set new start and end dates for section 3
+start_date_capm <- as.Date('01-01-2021',format = "%m-%d-%Y")
+end_date_capm <- as.Date('06-30-2024',format = "%m-%d-%Y")
+
+#Store weights from tangency portfolio
+tan_weight <- NULL
+for (i in 1:length(stocklist)) {
+  tan_weight[i] <- as.numeric(max_sr[i])
+}
+
+stock_data_trim1 <- stock_data[paste(start_date_capm, end_date_capm, sep = "/")]
+stock_returns_trim1 <- stock_returns_tbl %>% filter(index >= start_date_capm & index <= end_date_capm)
+stock_returns_trim1[1, -1] <- 0
+
+portfolio_returns_trim1 <- data.frame(Date=index(stock_returns_trim1),Returns=rowSums(as.matrix(stock_returns_trim1[,-1]) * tan_weight))
+
+portfolio_index_trim1 <- data.frame(
+  Date = index(stock_data_trim1),                     
+  Index = 100 * cumprod(1 + portfolio_returns_trim1$Returns)
+)
+
+#Add in S&P 500 as benchmark for comparison
+sp500_monthly <- getSymbols("^GSPC", src = "yahoo", from = start_date, to = end_date, periodicity='monthly', auto.assign = FALSE)[,6]
+sp500_returns_trim1 <-  diff(log(sp500_monthly)) %>% na.omit()
+sp500_returns_trim1 <- sp500_returns_trim1[paste(start_date_capm, end_date_capm, sep = "/")]
+sp500_returns_trim1[1,1] <-0
+
+norm_sp500 <- data.frame(Date = index(sp500_returns_trim1[1,1]),norm_sp500 = 100*cumprod(1 + sp500_returns_trim1$GSPC.Adjusted))
+
+comb_index <- cbind(portfolio_index_trim1, norm_sp500[-1])
+comb_index$Date <- rownames(comb_index)
+comb_index$Date <- as.Date(comb_index$Date)
+
+
+comb_index %>%
+  ggplot() +
+  geom_line(aes(x = Date, y = Index, color = "Tangency Portfolio"), data = comb_index) +
+  geom_line(aes(x = Date, y = GSPC.Adjusted, color = "S&P 500"), data = comb_index) +
+  geom_point(aes(x = Date, y = Index, color = "Tangency Portfolio"), data = comb_index) +
+  geom_point(aes(x = Date, y = GSPC.Adjusted, color = "S&P 500"), data = comb_index) +
+  theme_minimal() +
+  labs(
+    title = 'Tangency Portfolio vs S&P 500 (2021M1 - 2024M6)',
+    x = "Date",
+    y = "Index Value",
+    color = "Asset"
+  ) +
+  scale_color_manual(
+    values = c("Tangency Portfolio" = "#FEAA3E", "S&P 500" = "black"),
+    labels = c("S&P 500", "Tangency Portfolio")
+  ) +
+  scale_y_continuous(
+    breaks = seq(80, 220, by = 20),  # Custom breaks
+    labels = scales::number_format(accuracy = 1)
+  ) +
+    scale_x_date(
+    date_labels = "%Y-%m",           # Display dates as "Year-Month"
+    date_breaks = "6 months"         # Breaks every 6 months
+  ) +
+  theme(legend.position = "top")
+
+# Test the statistical difference between mean return and risk of tangency portfolio and S&P 500
+f_test <- var.test(x=portfolio_returns_trim1$Returns,y=sp500_returns_trim1$GSPC.Adjusted)
+print(f_test)
+if (f_test$p.value < 0.05) {
+  # Null hypothesis rejected: Variances are unequal
+  t_test <- t.test(x = portfolio_returns_trim1$Returns, 
+                          y = sp500_returns_trim1$GSPC.Adjusted, 
+                          var.equal = FALSE)
+} else {
+  # Null hypothesis not rejected: Variances are equal
+  t_test <- t.test(x = portfolio_returns_trim1$Returns, 
+                          y = sp500_returns_trim1$GSPC.Adjusted,  
+                          var.equal = TRUE)
+}
+print(t_test)
+
+-----------------------------------------------------------------------------------------------------
+
+##4. Regression, CAPM, and Security Market Line (SML) (2021M1 - 2024M6)
+
+bmrk_trim1 <- bmrk[paste(start_date_capm, end_date_capm, sep = "/")][-1]
+
+capm_df <- data.frame(Date=portfolio_returns_trim1$Date[-1],
+                      port_ret_premium = portfolio_returns_trim1$Returns[-1] - bmrk_trim1$TNX.Adjusted,
+                      mkt_ret_premium = sp500_returns_trim1$GSPC.Adjusted[-1] - bmrk_trim1$TNX.Adjusted,
+                      rf = bmrk_trim1$TNX.Adjusted
+                      )
+colnames(capm_df) <- c('Date','port_ret_premium','mkt_ret_premium','rf')
+reg <- summary(lm(data = capm_df, port_ret_premium ~ mkt_ret_premium))
+port_beta <- reg$coefficients[2]
+reg
+avg_mkt_pre <- mean(capm_df$mkt_ret_premium)
+avg_rf <- mean(capm_df$rf)
+sml_beta <- seq(0,2,length.out=nrow(capm_df))
+exp_return <- (sml_beta*avg_mkt_pre)+avg_rf
+
+#Security Market Line plot
+
+ggplot(data=NULL,aes(x=sml_beta,y=exp_return))+
+  geom_point()+
+  geom_line()+
+  geom_point(aes(x=port_beta,y=mean(portfolio_returns_trim1$Returns[-1])),size=4)+
+  geom_point(aes(x=port_beta,y=mean(portfolio_returns_trim1$Returns[-1])),color="#ebce51",size=3)+
+  annotate(x=port_beta+0.15,y=mean(portfolio_returns_trim1$Returns[-1]-0.0005),'text',label='Tangency Portfolio',fontface = "bold")+
+  annotate(x=max(sml_beta)-0.3,y=max(exp_return),
+           'text',label='Security Market Line',fontface = "bold")+
+  labs(x='Beta',y='Return',title='Security Market Line for Tangency Portfolio')+
+  theme_minimal()+
+  scale_y_continuous(labels = scales::percent)
+
+#CAPM Regression Plot
+
+capm_df %>%
+  ggplot(aes(x=mkt_ret_premium,y=port_ret_premium))+
+  geom_point(color="#ebce51",size=4)+
+  labs(x='Market Return Premium',y='Portfolio Return Premium',title='CAPM Regression')+
+  theme_minimal()+
+  scale_y_continuous(limits = c(-.25, .25),labels = scales::percent)+
+  scale_x_continuous(labels = scales::percent)+
+  geom_smooth(method = "lm", se = FALSE,color='#0e0b02', size = 1) +
+  annotate(x=max(capm_df$mkt_ret_premium)-0.02,y=max(capm_df$port_ret_premium)-0.18,
+           'text',label=paste('y =', round(reg$coefficients[1], 3),'+',round(reg$coefficients[2], 3),'X'),
+           fontface = "bold",
+           color='black')
+
+-----------------------------------------------------------------------------------------------------
+
+##5. Dummy Variable Regression to test whether COVID-19 shutdown (2020M3 – 2020M6) had any effect on Jensen Alpha and market risk
+
+#Create a regression with full data from 2017M1 to 2024M10
+
+portfolio_returns_full <- data.frame(Date = index(stock_returns),Returns=rowSums(as.matrix(stock_returns) * tan_weight))
+sp500_returns <- data.frame(Date = index(sp500_monthly)[-1],Returns=diff(log(sp500_monthly)) %>% na.omit())
+
+capm_df_full <- data.frame(Date=portfolio_returns_full$Date,
+                      port_ret_premium = portfolio_returns_full$Returns - bmrk$TNX.Adjusted,
+                      mkt_ret_premium = sp500_returns$GSPC.Adjusted - bmrk$TNX.Adjusted,
+                      rf = bmrk$TNX.Adjusted,
+                      covid_dummy=0
+                      )
+capm_df_full[capm_df_full$Date >= as.Date('2020-03-01') & 
+                              capm_df_full$Date <= as.Date('2020-06-01'), "covid_dummy"] <- 1
+colnames(capm_df_full) <- c('Date','port_ret_premium','mkt_ret_premium','rf','covid_dummy')
+reg_wo_dummy <- summary(lm(port_ret_premium~mkt_ret_premium,data=capm_df_full))
+reg_w_dummy <- summary(lm(port_ret_premium~mkt_ret_premium*covid_dummy,data=capm_df_full))
+
+reg_wo_dummy
+reg_w_dummy
+j_alpha <- portfolio_returns_full$Returns - port_beta * capm_df_full$mkt_ret_premium  # Use portfolio_returns
+j_alpha_df <- data.frame(Date=portfolio_returns_full$Date, Alpha=j_alpha, covid_dummy=capm_df_full$covid_dummy)
+colnames(j_alpha_df) <- c("Date", "Alpha", "Covid_indicator")
+
+j_alpha_df %>%
+  ggplot(aes(x = Date, y = Alpha, color = factor(Covid_indicator))) +
+  geom_point(size = 3) +  # Points for individual data points
+  scale_color_manual(
+    values = c("1" = "#ED4F52", "0" = "#E7DC55"),
+    labels = c("0" = "Normal", "1" = "COVID")
+  ) + 
+  annotate(
+    geom = 'text',
+    x = as.Date('2020-05-01'), 
+    y = j_alpha_df[j_alpha_df$Date == as.Date('2020-03-01'), "Alpha"] + 0.01,
+    label = "COVID",
+    color = 'black',
+    size = 4.5
+  ) +
+  annotate(
+    geom = 'text',
+    x = as.Date('2020-09-01'),
+    y = j_alpha_df[j_alpha_df$Date == as.Date('2020-07-01'), "Alpha"] - 0.04,  
+    label = 'Re-open',
+    color = 'black',
+    size = 4.5
+  ) +
+  labs(
+    title = "Jensen's Alpha Over Time",
+    x = "Date",
+    y = "Alpha",
+    color = "Indicator"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_x_date(date_labels = "%Y-%m", date_breaks = "6 month") +
+  scale_y_continuous(limits = c(-.2, .2),labels = scales::percent)
+
+-----------------------------------------------------------------------------------------------------
+
+##6. Portfolio Statistics (CV, Sharpe, Treynor, Sortino Ratios) vs Other Diversified Portfolio (2017M1 - 2024M10)
+
+#Calculate portfolio statistics (Expected Return, Variance, Standard Deviation, Sharpe Ratio, Treynor Ratio, Coefficient of Variation, and Sortino Ratio)
+r_s_allowed <- t(w_s_allowed) %*% avg_ret_matrix
+r_ns <- t(w_ns) %*% avg_ret_matrix
+r_gmv <- t(w_gmv) %*% avg_ret_matrix
+v_s_allowed <- t(w_s_allowed) %*% vcv_matrix %*% w_s_allowed
+v_ns <- t(w_ns) %*% vcv_matrix_ns %*% w_ns
+v_gmv <- t(w_gmv) %*% vcv_matrix %*% w_gmv
+sd_s_allowed <- v_s_allowed^0.5
+sd_ns <- v_ns^0.5
+sd_gmv <- v_gmv^0.5
+sharpe_s_allowed <- (r_s_allowed - bmrk_mean) / (sd_s_allowed)
+sharpe_ns <- (r_ns - bmrk_mean) / (sd_ns)
+sharpe_gmv <- (r_gmv - bmrk_mean) / (sd_gmv)
+
+#Download stock prices for Vanguard S&P 500 ETF (VOO)
+VOO_monthly <- getSymbols("VOO", src = "yahoo", from = start_date, to = end_date, periodicity='monthly', auto.assign = FALSE)[,6]
+VOO_returns <- diff(log(VOO_monthly)) %>% na.omit()
+index(VOO_returns) <- as.Date(format(index(VOO_returns), "%Y-%m-01"))
+colnames(VOO_returns) <- "VOO_Logreturn"
+
+all_returns <- cbind(stock_returns,VOO_returns)
+
+library(dplyr)
+cov_matrix <- cov(all_returns)
+
+Sigma_im <- cov_matrix[1:ncol(cov_matrix-1), ncol(cov_matrix)]
+Sigma_mm <- cov_matrix[nrow(cov_matrix), ncol(cov_matrix)]
+betas <- Sigma_im / Sigma_mm
+betas <- betas[-length(betas)]
+port_beta_s_allowed <- betas %*% w_s_allowed
+port_beta_ns <- betas %*% w_ns
+port_beta_gmv <- betas %*% w_gmv
+
+treynor_s_allowed <- (r_s_allowed - bmrk_mean) / port_beta_s_allowed
+treynor_ns <- (r_ns- bmrk_mean) / port_beta_ns
+treynor_gmv <- (r_gmv- bmrk_mean) / port_beta_gmv
+cv_s_allowed <- sd_s_allowed / r_s_allowed
+cv_ns <- sd_ns / r_ns
+cv_gmv <- sd_gmv / r_gmv
+
+#Find downside deviation for Sortino Ratio
+w_ret_s_allowed <- stock_returns %*% w_s_allowed
+w_ret_ns <- stock_returns %*% w_ns
+w_ret_gmv <- stock_returns %*% w_gmv
+
+dev_s_allowed <- w_ret_s_allowed - mean(w_ret_s_allowed)
+dev_ns <- w_ret_ns - mean(w_ret_ns)
+dev_gmv <- w_ret_gmv - mean(w_ret_gmv)
+
+sdev_s_allowed <- replace(dev_s_allowed, dev_s_allowed > 0, 0) 
+sdev_ns <- replace(dev_ns, dev_ns > 0, 0)
+sdev_gmv <- replace(dev_gmv, dev_gmv > 0, 0)
+
+sd_sdev_s_allowed <- sqrt(var(sdev_s_allowed))
+sd_sdev_ns <- sqrt(var(sdev_ns))
+sd_sdev_gmv <- sqrt(var(sdev_gmv))
+
+sortino_s_allowed <- (r_s_allowed - bmrk_mean) / (sd_sdev_s_allowed)
+sortino_ns <- (r_ns - bmrk_mean) / (sd_sdev_ns)
+sortino_gmv <- (r_gmv - bmrk_mean) / (sd_sdev_gmv)
+
+r_s_allowed <- as.numeric(r_s_allowed)
+r_ns <- as.numeric(r_ns)
+r_gmv <- as.numeric(r_gmv)
+v_s_allowed <- as.numeric(v_s_allowed)
+v_ns <- as.numeric(v_ns)
+v_gmv <- as.numeric(v_gmv)
+sd_s_allowed <- as.numeric(sd_s_allowed)
+sd_ns <- as.numeric(sd_ns)
+sd_gmv <- as.numeric(sd_gmv)
+sharpe_s_allowed <- as.numeric(sharpe_s_allowed)
+sharpe_ns <- as.numeric(sharpe_ns)
+sharpe_gmv <- as.numeric(sharpe_gmv)
+treynor_s_allowed <- as.numeric(treynor_s_allowed)
+treynor_ns <- as.numeric(treynor_ns)
+treynor_gmv <- as.numeric(treynor_gmv)
+cv_s_allowed <- as.numeric(cv_s_allowed)
+cv_ns <- as.numeric(cv_ns)
+cv_gmv <- as.numeric(cv_gmv)
+sortino_s_allowed <- as.numeric(sortino_s_allowed)
+sortino_ns <- as.numeric(sortino_ns)
+sortino_gmv <- as.numeric(sortino_gmv)
+
+#Calculate S&P 500 statistics for benchmarking
+
+r_voo <- mean(VOO_returns, na.rm = TRUE)     
+v_voo <- var(VOO_returns, na.rm = TRUE)              
+sd_voo <- sqrt(v_voo)                           
+sharpe_voo <- (r_voo - bmrk_mean) / sd_voo     
+cv_voo <- sd_voo / r_voo                       
+dev_voo <- sp500_returns_trim1[-1] - mean(sp500_returns_trim1[-1])
+sdev_voo <- replace(dev_voo, dev_voo > 0, 0)              
+sd_sdev_voo <- sqrt(var(sdev_voo))                               
+sortino_voo <- (r_voo - bmrk_mean) / sd_sdev_voo
+treynor_voo <- (r_voo - bmrk_mean) / 1
+
+r_voo <- as.numeric(r_voo)
+v_voo <- as.numeric(v_voo)
+sd_voo <- as.numeric(sd_voo)
+sharpe_voo <- as.numeric(sharpe_voo)
+cv_voo <- as.numeric(cv_voo)
+dev_voo <- as.numeric(dev_voo)
+sdev_voo <- as.numeric(sdev_voo)
+sd_sdev_voo <- as.numeric(sd_sdev_voo)
+sortino_voo <- as.numeric(sortino_voo)
+treynor_voo <- as.numeric(treynor_voo)
+
+#Display portfolio statistics
+results_table <- data.frame(
+  Metric = c("Expected Return", "Variance", "Standard Deviation", 
+             "Sharpe Ratio", "Treynor Ratio", "Coefficient of Variation", "Sortino Ratio"),
+  `Short Sale Allowed` = c(r_s_allowed, v_s_allowed, sd_s_allowed, 
+                            sharpe_s_allowed, treynor_s_allowed, cv_s_allowed, sortino_s_allowed),
+  `No Short Sale` = c(r_ns, v_ns, sd_ns, 
+                                sharpe_ns, treynor_ns, cv_ns, sortino_ns),
+  `Global Minimum Variance` = c(r_gmv, v_gmv, sd_gmv, 
+                      sharpe_gmv, treynor_gmv, cv_gmv, sortino_gmv),
+  `VOO` = c(r_voo, v_voo, sd_voo, 
+                      sharpe_voo, treynor_voo, cv_voo, sortino_voo)
+)
+library(knitr)
+kable(results_table, caption = "Portfolio Statistics")
+
+-----------------------------------------------------------------------------------------------------
+
+##7. 2% VaR As Percentage of Mean Return of Portfolio (Risk Horizon: 1M, 6M, 1Y). Compare against VOO.
+
+# Set VaR threshold to be 2%
+var_threshold_voo <- quantile(VOO_returns, 0.02)
+var_threshold_port <- quantile(portfolio_returns_full$Returns, 0.02)
+
+# Create return distribution plots for S&P and Tangency Portfolio
+var_voo <- ggplot() +
+  geom_histogram(data = VOO_returns, aes(x = VOO_Logreturn), fill = '#072C20', bins = 50, color = '#072C20') +
+  geom_histogram(data = subset(VOO_returns, VOO_Logreturn < var_threshold_voo),aes(x = VOO_Logreturn), fill = 'red', bins=30, color     = 'black' ) +
+  theme_minimal() +
+  labs(x = 'Monthly Return',y = 'Frequency',title = 'Market Portfolio VaR (2%)') +
+  scale_x_continuous(labels = scales::percent)
+
+var_port <- ggplot() +
+  geom_histogram(data = portfolio_returns_full, aes(x = Returns), fill = '#110132', bins = 50, color = '#110132') +
+  geom_histogram(data = subset(portfolio_returns_full, Returns < var_threshold_port),aes(x = Returns), fill = 'red', bins      = 30, color = 'black' ) +
+  theme_minimal() +
+  labs(x = 'Monthly Return',y = 'Frequency',title = 'Portfolio VaR (2%)') +
+  scale_x_continuous(labels = scales::percent)
+
+# Display the plot
+grid.arrange(var_voo,var_port)
+
+#Calculate VaR as a percentage of the mean return of portfolio
+library(tidyr)
+
+var_calc <- function(returns, alpha, time_horizon) {
+  mu <- mean(returns)
+  sigma <- sd(returns)
+  modified_mu <- mu * time_horizon
+  modified_sigma <- sigma * sqrt(time_horizon)
+  VaR <- qnorm(alpha, mean = modified_mu, sd = modified_sigma)
+  return(VaR)
+}
+
+# Define the alpha and time horizons
+alpha <- 0.02
+risk_horizons <- c(1, 6, 12)
+
+# Calculate VaR for the portfolio
+port_var <- sapply(risk_horizons, function(horizon) {
+  var_calc(portfolio_returns_full$Returns, alpha, horizon)
+})
+
+# Calculate VaR for the market
+mkt_var <- sapply(risk_horizons, function(horizon) {
+  var_calc(VOO_returns$VOO_Logreturn, alpha, horizon)
+})
+
+# Assemble in data frame
+var_df <- data.frame(Risk_Horizon = paste(risk_horizons*30,'day VaR'), 
+           Portfolio_VaR = abs(port_var),
+           Market_VaR = abs(mkt_var))
+
+var_df_long <- gather(var_df, Category, VaR, -Risk_Horizon)
+var_df_long
+# Plot Market vs Portfolio VaR across horizons
+ggplot(var_df_long, aes(x = Risk_Horizon, y = VaR, fill = Category)) +
+  geom_bar(stat = "identity", position = "dodge", color = "black") +  # Grouped bars
+  labs(
+    title = "Value at Risk (VaR) Comparison: Portfolio vs Market",
+    x = "Risk Horizon",
+    y = "VaR"
+  ) +
+  theme_minimal() +
+  scale_y_continuous(labels = scales::percent) +  # Percent formatting for y-axis
+  scale_fill_manual(
+    values = c("Portfolio_VaR" = "#CF8317", "Market_VaR" = "#537D92"),
+    labels = c("Market VaR", "Portfolio VaR")
+  ) +
+  theme(legend.position = "top",axis.text.x = element_text(angle = 45, hjust = 1) 
+  )
+
+-----------------------------------------------------------------------------------------------------
+
+##8. Scatter diagram of portfolio vs S&P 500
+
+scatter_df <- data.frame(
+  Date = portfolio_returns_full$Date,
+  Port_Returns = portfolio_returns_full$Returns,
+  SP500_Returns = sp500_returns$GSPC.Adjusted
+)
+
+ggplot() +
+  geom_rect(
+    aes(xmin = as.Date("2020-03-01"),xmax = as.Date("2020-06-01"),ymin = -0.5,ymax = 0.5,fill = "COVID"),alpha = 0.5
+  ) +
+  geom_point(aes(x = scatter_df$Date, y = scatter_df$Port_Returns, color = "Portfolio Returns"), size = 3, alpha = 0.6) +
+  geom_point(aes(x = scatter_df$Date, y = scatter_df$SP500_Returns, color = "S&P 500 Returns"), size = 3, alpha = 0.6) +
+  labs(title = "Scatter Plot of Monthly Portfolio and S&P 500 Returns (2017M1 - 2024M10)", x = "Date",y = "Returns",color = "Legend",fill = "Highlight") +
+  theme_minimal() +
+  scale_y_continuous(labels = scales::percent, limits = c(-0.5, 0.5)) +
+  scale_x_date(date_labels = "%Y-%m", date_breaks = "12 months") +
+  scale_color_manual(values = c("Portfolio Returns" = "#2A0ADB", "S&P 500 Returns" = "#D7670F")) + 
+  scale_fill_manual(values = c("COVID" = "#F7F066")) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "top")
+
+-----------------------------------------------------------------------------------------------------
+
+##9. Two-Period Ex-Post Forecasting with Derived CAPM Model (2021M1 - 2024M6)
+forecast_periods <- (nrow(capm_df) - 1):nrow(capm_df)
+
+# CAPM Forecasts
+capm_df$forecast <- reg$coefficients[1] + reg$coefficients[2] * capm_df$mkt_ret_premium
+
+# Extract the actual and forecast returns for forecast periods
+ex_post <- capm_df[forecast_periods, c("port_ret_premium", "forecast")]
+
+# Calculate accuracy statistics
+
+accuracy_stats <- forecast::accuracy(ex_post$forecast,ex_post$port_ret_premium)
+# Display results
+print(ex_post)
+print(accuracy_stats)
+
+-----------------------------------------------------------------------------------------------------
+
+##10. Ex-ante forecasting of returns to portfolio for 2024M7 and 2024M8
+ex_ante_data <- data.frame(
+  Date = as.Date(c("2024-07-01", "2024-08-01")),
+  port_ret_premium = c(capm_df_full[capm_df_full$Date >= as.Date("2024-07-01") & capm_df_full$Date <= as.Date("2024-08-01"),"port_ret_premium"])
+)
+# Use CAPM equation to forecast portfolio returns
+ex_ante_data$forecast <- reg$coefficients[1] + reg$coefficients[2] * ex_ante_data$port_ret_premium
+
+# Difference between forecast and actual market return premium
+ex_ante_data$difference <- ex_ante_data$forecast-ex_ante_data$port_ret_premium
+accuracy_stats_1 <- forecast::accuracy(ex_ante_data$forecast,ex_ante_data$port_ret_premium)
+
+# Display ex-ante forecasts
+print(ex_ante_data)
+print(accuracy_stats_1)
+
+-----------------------------------------------------------------------------------------------------
+
+##11. Naïve forecasting, MA(5), and Exponential Smoothing of Portfolio Index(2020M1 - 2024M8)
+
+portfolio_returns_full <- data.frame(Date = index(stock_data),Returns=c(0,rowSums(as.matrix(stock_returns_tbl[,-1]) * tan_weight)))
+portfolio_index_full <- data.frame(
+  Date = index(stock_data), 
+  Index = 100 * cumprod(1 + portfolio_returns_full$Returns)
+)
+
+#Convert index to time series
+ts_port <- ts(portfolio_index_full,start=c(2017,1),frequency = 12)
+ts_port <- ts_port[, 2]
+ts_port_train <- window(ts_port,start=2020,end=c(2024,8))
+ts_port_test <- window(ts_port,start=c(2024,9))
+
+fit_naive <- naive(ts_port_train,h=2)
+fit_ma <- ma(ts_port_train, order=5)
+ets_model <- ets(ts_port_train)
+fit_ets <- forecast(ets_model, h=2)
+fit_ses <- ses(ts_port_train,h=2) 
+fit_hwa <- hw(ts_port_train,seasonal = 'additive',h=2)
+fit_hwm <- hw(ts_port_train,seasonal = 'multiplicative',h=2)
+
+naive <- autoplot(ts_port,color='grey40',size=1)+
+  autolayer(fit_naive,PI=TRUE,series = 'Naive Forecast',size=1.2)+
+  autolayer(ts_port_test,series=NA,color='black',linetype='longdash')+
+  labs(x='Date', y='Index',title='Naive Forecast')+
+  theme_bw()+
+  scale_colour_manual(name='Method',values=c('#2563EB'))+  
+  theme(
+    legend.position=c(0.01, 0.98),
+    legend.justification=c('left', 'top'),
+    legend.key.size = unit(0.1, "inch"),
+    legend.text = element_text(size = 6),  
+    legend.title = element_text(size = 8) 
+  )
+
+ma <- autoplot(ts_port,color='grey40',size=1)+
+  autolayer(fit_ma,PI=TRUE,series = 'MA(5) Forecast',size=1.2)+
+  autolayer(ts_port_test,series=NA,color='black',linetype='longdash')+
+  labs(x='Date', y='Index',title='MA(5)')+
+  theme_bw()+
+  scale_colour_manual(name='Method',values=c('#2563EB'))+  
+  theme(
+    legend.position=c(0.01, 0.98),
+    legend.justification=c('left', 'top'),
+    legend.key.size = unit(0.1, "inch"),  
+    legend.text = element_text(size = 6), 
+    legend.title = element_text(size = 8) 
+  )
+
+ets <- autoplot(ts_port,color='grey40',size=1)+
+  autolayer(fit_ets,PI=TRUE,series = 'ETS Forecast',size=1.2)+
+  autolayer(ts_port_test,series=NA,color='black',linetype='longdash')+
+  labs(x='Date', y='Index',title='Exponential State Space Model')+
+  theme_bw()+
+  scale_colour_manual(name='Method',values=c('#2563EB'))+  
+  theme(
+    legend.position=c(0.01, 0.98),
+    legend.justification=c('left', 'top'),
+    legend.key.size = unit(0.1, "inch"),  
+    legend.text = element_text(size = 6), 
+    legend.title = element_text(size = 8)  
+  )
+
+ses <- autoplot(ts_port,color='grey40',size=1)+
+  autolayer(fit_ses,PI=TRUE,series = 'Simple Exponential Smoothing',size=1.2)+
+  autolayer(ts_port_test,series=NA,color='black',linetype='longdash')+
+  labs(x='Date', y='Index',title='Simple Exponential Smoothing')+
+  theme_bw()+
+  scale_colour_manual(name='Method',values=c('orangered'))+
+  theme(
+    legend.position=c(0.01, 0.98),
+    legend.justification=c('left', 'top'),
+    legend.key.size = unit(0.1, "inch"),  
+    legend.text = element_text(size = 6),  
+    legend.title = element_text(size = 8)
+  )
+
+hwa <- autoplot(ts_port,color='grey40',size=1)+
+  autolayer(fit_hwa,PI=TRUE,series = 'Holt-Winter Additive',size=1.2)+
+  autolayer(ts_port_test,series=NA,color='black',linetype='longdash')+
+  labs(x='Date', y='Index',title='Holt-Winter Additive Forecast')+
+  theme_bw()+
+  scale_colour_manual(name='Method',values=c('red'))+
+  theme(
+    legend.position=c(0.01, 0.98),
+    legend.justification=c('left', 'top'),
+    legend.key.size = unit(0.1, "inch"),  
+    legend.text = element_text(size = 6), 
+    legend.title = element_text(size = 8)  
+  )
+
+hwm <- autoplot(ts_port,color='grey40',size=1)+
+  autolayer(fit_hwm,PI=TRUE,series = 'Holt-Winter Multiplicative',size=1.2)+
+  autolayer(ts_port_test,series=NA,color='black',linetype='longdash')+
+  labs(x='Date', y='Index',title='Holt-Winter Multiplicative Forecast')+
+  theme_bw()+
+  scale_colour_manual(name='Method',values=c('purple'))+
+  theme(
+    legend.position=c(0.01, 0.98),
+    legend.justification=c('left', 'top'),
+    legend.key.size = unit(0.1, "inch"),  
+    legend.text = element_text(size = 6), 
+    legend.title = element_text(size = 8) 
+  )
+library(gridExtra)
+grid.arrange(naive,ma,ets,ses,hwa,hwm,ncol=2)
+
+# Combine accuracy metrics for all models
+accuracy_naive <- forecast::accuracy(fit_naive, ts_port)
+accuracy_ets <- forecast::accuracy(fit_ets, ts_port)
+accuracy_ses <- forecast::accuracy(fit_ses, ts_port)
+accuracy_hwa <- forecast::accuracy(fit_hwa, ts_port)
+accuracy_hwm <- forecast::accuracy(fit_hwm, ts_port)
+
+# Combine into a single data frame
+accuracy_df <- rbind(
+  Naive = accuracy_naive,
+  ETS = accuracy_ets,
+  SES = accuracy_ses,
+  HWA = accuracy_hwa,
+  HWM = accuracy_hwm
+)
+
+# Add row labels for training and testing sets
+rownames(accuracy_df) <- c(
+  'Naive train', 'Naive test',
+  'ETS train', 'ETS test',
+  'SES train', 'SES test',
+  'HWA train', 'HWA test',
+  'HWM train', 'HWM test'
+)
+
+library(knitr)
+# Display the accuracy table for training sets
+kable(accuracy_df[seq(1, nrow(accuracy_df), by = 2), ], caption = "Training Set Accuracy")
+
+# Display the accuracy table for test sets
+kable(accuracy_df[seq(2, nrow(accuracy_df), by = 2), ], caption = "Test Set Accuracy")
+
